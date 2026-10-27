@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# VERSION 2.3
+# VERSION 2.4
 """
-KeyShot 八视图批量渲染 v2.3（在 KeyShot 的脚本窗口中运行）。
+KeyShot 八视图批量渲染 v2.4（在 KeyShot 的脚本窗口中运行）。
 
 默认输出：当前已保存 BIP 场景所在文件夹/当前可见模型组名称+八视图。
 多个模型组同时可见时，用“+”连接名称，例如“模型A+模型B八视图”。
@@ -9,6 +9,8 @@ KeyShot 八视图批量渲染 v2.3（在 KeyShot 的脚本窗口中运行）。
 只读取可见零件的世界坐标包围盒；隐藏的父组、模型和未激活模型集均排除。
 不移动、不删除、不显示/隐藏任何模型，不保存或覆盖 BIP 场景。
 运行信息仅显示在脚本控制台，不生成日志文件。
+默认沿用当前场景的渲染尺寸，并检查画幅比例，避免强制改变比例造成拉伸。
+渲染期间锁定场景比例与分辨率，结束或报错后恢复原来的锁定状态。
 
 取景算法已用 KeyShot 11.1 验证：正交画面宽度 =
 2 * camera_distance * tan(horizontal_fov / 2)。
@@ -30,8 +32,10 @@ OUTPUT_DIR_OVERRIDE = r""
 FILE_PREFIX_OVERRIDE = r""
 OUTPUT_EXT = "png"
 NUMBERED_FILENAMES = True
-RENDER_WIDTH_OVERRIDE = 2560
-RENDER_HEIGHT_OVERRIDE = 1599
+# 同时为 0：使用当前场景的渲染尺寸（推荐）。
+# 手动指定宽高时，其比例必须与“项目 > 图像”中的场景画幅一致。
+RENDER_WIDTH_OVERRIDE = 0
+RENDER_HEIGHT_OVERRIDE = 0
 
 # 模型包围范围占画面的比例；0.85 为约 85%，调大则模型更大。
 # 包围盒会略大于真实轮廓，尤其是斜视图。建议 0.80～0.90。
@@ -76,7 +80,7 @@ def message_box(message, error=False):
         return
     try:
         lux.getMessageBox(
-            msg=message, title="KeyShot 八视图 v2.3",
+            msg=message, title="KeyShot 八视图 v2.4",
             type=lux.MESSAGE_BOX_CRITICAL if error else lux.MESSAGE_BOX_INFO)
     except Exception:
         print(message)
@@ -169,16 +173,36 @@ def get_output_dir(info, scene_file, folder_name="当前模型八视图"):
 
 
 def get_render_size(info):
+    data = normalized_info(info)
     if bool(RENDER_WIDTH_OVERRIDE) != bool(RENDER_HEIGHT_OVERRIDE):
         raise RuntimeError("宽和高需要同时填写，或同时设为 0。")
     if RENDER_WIDTH_OVERRIDE and RENDER_HEIGHT_OVERRIDE:
         size = int(RENDER_WIDTH_OVERRIDE), int(RENDER_HEIGHT_OVERRIDE)
     else:
-        data = normalized_info(info)
         size = (int(data.get("renderwidth") or data.get("renderingwidth") or 0),
                 int(data.get("renderheight") or data.get("renderingheight") or 0))
     if min(size) <= 0:
         raise RuntimeError("无法取得输出尺寸，请设置脚本顶部的宽和高。")
+    scene_width = int(data.get("width") or 0)
+    scene_height = int(data.get("height") or 0)
+    if scene_width > 0 and scene_height > 0:
+        # KeyShot 的场景画幅与 renderImage 的输出宽高需要保持相同比例。
+        # 大图输出时只传入不同比例的宽高可能直接压缩/拉伸图像。
+        # 允许 0.2% 的差异，以容纳实时视窗按整像素缩放产生的舍入误差。
+        mismatch = abs(float(size[0]) * scene_height / (size[1] * scene_width) - 1.0)
+        if mismatch > 0.002:
+            suggested_height = max(1, int(round(float(size[0]) * scene_height / scene_width)))
+            if RENDER_WIDTH_OVERRIDE and RENDER_HEIGHT_OVERRIDE:
+                raise RuntimeError(
+                    "指定输出 {0} × {1} 与当前场景画幅 {2} × {3} 的宽高比不同，"
+                    "继续渲染可能导致图片拉伸。\n"
+                    "请将 RENDER_WIDTH_OVERRIDE 和 RENDER_HEIGHT_OVERRIDE 同时设为 0，"
+                    "或先在 KeyShot 的“项目 > 图像”中设置目标画幅。\n"
+                    "保持当前场景比例时，宽度 {0} 对应高度约为 {4}。".format(
+                        size[0], size[1], scene_width, scene_height, suggested_height))
+            log("渲染尺寸与场景画幅比例不同，自动保持场景比例：{0} × {1} -> {0} × {2}".format(
+                size[0], size[1], suggested_height))
+            size = (size[0], suggested_height)
     return size
 
 
@@ -391,6 +415,8 @@ def main():
     out_dir = select_run_folder(out_dir, filenames)
     rendered = []
     old_camera = lux.getCamera()
+    old_keep_aspect = lux.getKeepAspectRatio()
+    old_lock_resolution = lux.getLockResolution()
     try:
         log("KeyShot 版本：{0}".format(lux.getKeyShotVersion()))
         log("场景信息：{0!r}".format(info))
@@ -399,6 +425,11 @@ def main():
         log("渲染方式：本地逐张完成，保留当前渲染质量设置。")
         opts = get_render_options()
         try:
+            # 保持 KeyShot 的相机画幅稳定；只更改输出像素数或关闭锁定，
+            # 在部分场景的大图渲染中会导致比例变化甚至裁切。
+            lux.setKeepAspectRatio(True)
+            lux.setLockResolution(True)
+            lux.sync()
             make_work_camera()
             for index, (label, azimuth, inclination) in enumerate(VIEW_DEFS, 1):
                 log("渲染 {0}/8：{1}".format(index, label))
@@ -412,9 +443,15 @@ def main():
                 rendered.append(path)
                 log("已生成：{0}".format(path))
         finally:
-            if old_camera:
-                lux.setCamera(old_camera)
-            lux.sync()
+            try:
+                if old_camera:
+                    lux.setCamera(old_camera)
+            finally:
+                try:
+                    lux.setLockResolution(old_lock_resolution)
+                finally:
+                    lux.setKeepAspectRatio(old_keep_aspect)
+                    lux.sync()
         log("完成，共生成 {0} 张图片。".format(len(rendered)))
     except BaseException:
         log("未完成。已生成 {0} 张。输出目录：{1}".format(len(rendered), out_dir))
